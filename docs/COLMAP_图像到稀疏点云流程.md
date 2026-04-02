@@ -1,4 +1,4 @@
-# 从图像到稀疏 3D 点云（OpenSplat 之前）
+# 使用COLMAP从图像到稀疏 3D 点云
 
 本文说明在 **OpenSplat** 训练之前，如何用 **COLMAP** 从 RGB 图像得到 **稀疏重建**（相机位姿 + 3D 点），工程目录以 `colmap_ws` 为例。
 
