@@ -3,9 +3,17 @@
 from pathlib import Path
 from PIL import Image
 
-# 按你的路径修改（下面示例为 WSL 下的 colmap_ws）
-SRC = Path("/home/ccxx/colmap_ws/images")
-DST = Path("/home/ccxx/colmap_ws/images_small")
+# WSL 下工程根目录（COLMAP_WS / colmap_ws）
+BASE = Path("/home/ccxx/colmap_ws")
+
+# 默认：从原图目录 → 输出到 images_small（与 sparse 配套时，上传用 images_small 替代 images）
+SRC = BASE / "images"
+DST = BASE / "images_small"
+
+# 若已没有 images、只想对 images_small 再压一轮，请改成例如：
+# SRC = BASE / "images_small"
+# DST = BASE / "images_small2"
+
 JPEG_QUALITY = 82
 PNG_COMPRESS = 9
 
