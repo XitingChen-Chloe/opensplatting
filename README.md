@@ -221,7 +221,70 @@ BASE=/home/ccxx/colmap_ws IMAGE_SUB=images SPARSE_SUB=sparse/0 DENSE_SUB=dense .
 
 ---
 
-## 10. 命令速查（复制用）
+## 10. 压缩图像（减小体积、便于上传）
+
+上传平台有 **大小限制**（例如 2GB）或需节省空间时，可在 **不动稀疏几何文件** 的前提下，只对 **图像目录** 做压缩。**前提**：与当前使用的 **`sparse` / 相机** 一致——**文件名（含扩展名）不变**，**宽高（分辨率）不变**；否则投影与训练会错位。
+
+### 10.1 该压哪一套目录？
+
+| 阶段 | 建议压缩对象 |
+|------|----------------|
+| 已做 **§9 去畸变**、准备给 OpenSplat | 压 **`dense/images/`**（或已拷好的 **`opensplat_input/images/`**），并与 **`dense/sparse/`**（或 **`opensplat_input/sparse/0/`**）成对使用 |
+| 仅 COLMAP、尚未去畸变 | 压 **`images/`** 时须与对应 **`sparse`** 为同一重建；更稳妥是 **压图前已定稿 sparse**，且 **不重跑 mapper** 时只替换像素内容 |
+
+**不要**：把 **去畸变后的图** 与 **未去畸变的 sparse** 混用，或改分辨率后仍用旧 `cameras.bin`。
+
+### 10.2 方式一：`compress_images.py`（Pillow，偏无损/轻量）
+
+脚本：`colmap_ws/compress_images.py`。编辑其中 **`BASE`、`SRC`、`DST`**，例如从原图到 `images_small`：
+
+```python
+BASE = Path("/home/ccxx/colmap_ws")
+SRC = BASE / "images"
+DST = BASE / "images_small"
+```
+
+对 **去畸变图** 可改为 `SRC = BASE / "dense/images"`，`DST = BASE / "dense/images_small"` 等。
+
+```bash
+pip3 install --user pillow
+python3 /home/ccxx/colmap_ws/compress_images.py
+```
+
+- **JPEG**：降低 `JPEG_QUALITY` 可明显减小体积。  
+- **PNG**：主要为无损优化，**体积降幅通常有限**（照片类 PNG 仍很大）。
+
+### 10.3 方式二：`pngquant_images.sh`（有损 PNG，体积常明显下降）
+
+需先安装：`sudo apt install -y pngquant`。
+
+脚本：`colmap_ws/pngquant_images.sh`。默认从 **`images_small`** 生成 **`images_pngquant`**；可通过环境变量改输入/输出目录，例如对 **去畸变图** 生成 `dense/images_lq`：
+
+```bash
+cd /home/ccxx/colmap_ws
+chmod +x pngquant_images.sh
+BASE=/home/ccxx/colmap_ws SRC_NAME=dense/images DST_NAME=dense/images_lq ./pngquant_images.sh
+```
+
+可选 **`COLORS`**（默认 `256`，更小可试 `128`）：
+
+```bash
+COLORS=128 BASE=/home/ccxx/colmap_ws SRC_NAME=dense/images DST_NAME=dense/images_lq ./pngquant_images.sh
+```
+
+完成后用 **`dense/images_lq`** 作为上传用的 **`images`**（或将其中文件覆盖到 **`opensplat_input/images/`**），**`sparse` 仍用与去畸变配套的那一份**。
+
+### 10.4 体积仍过大时
+
+- 在 **pngquant** 基础上再略降 **`COLORS`**，或  
+- **抽帧**（图变少）需 **重做 COLMAP 稀疏重建**，不能仅删图不换模型；或  
+- 向课程方申请 **更大上传限额 / 分卷**。
+
+更细的说明（含常见问题）见同目录 **`WSL_图像压缩说明.md`**。
+
+---
+
+## 11. 命令速查（复制用）
 
 ```bash
 # 顺序匹配（WSL 无头 + CPU 匹配）
@@ -246,6 +309,9 @@ colmap model_analyzer --path sparse/0
 
 ---
 
-*文档对应流程：图像 →（特征）→ 匹配（`database.db`）→ 稀疏重建（`sparse/*/points3D.bin` 等）→（可选）去畸变 → PINHOLE → 再进入 OpenSplat。*
+*文档对应流程：图像 →（特征）→ 匹配（`database.db`）→ 稀疏重建（`sparse/*/points3D.bin` 等）→（可选）去畸变 → PINHOLE →（可选）压缩图像 → 再进入 OpenSplat。*
+
+*脚本：`colmap_undistort_to_pinhole.sh`（去畸变）、`compress_images.py` / `pngquant_images.sh`（压图）；压图详解见 `WSL_图像压缩说明.md`。*
+）→ 稀疏重建（`sparse/*/points3D.bin` 等）→（可选）去畸变 → PINHOLE → 再进入 OpenSplat。*
 
 *去畸变脚本：`colmap_undistort_to_pinhole.sh`*
