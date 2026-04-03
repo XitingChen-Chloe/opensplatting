@@ -1,4 +1,4 @@
-# 使用COLMAP从图像到稀疏 3D 点云
+# 从图像到稀疏 3D 点云（OpenSplat 之前）
 
 本文说明在 **OpenSplat** 训练之前，如何用 **COLMAP** 从 RGB 图像得到 **稀疏重建**（相机位姿 + 3D 点），工程目录以 `colmap_ws` 为例。
 
@@ -16,7 +16,7 @@ colmap_ws/
 ├── images/           # RGB 图像（文件名、顺序与后续数据库一致）
 ├── database.db       # SQLite：特征、匹配、图像元数据
 └── sparse/           # 稀疏重建输出（mapper 生成）
-    └── 0/            # 或其它编号
+    └── 0/            # 或其它编号（多模型时可有 0,1,2…）
 ```
 
 首次使用前若还没有 `database.db`，需先做 **特征提取**；若已从别处拷贝 `database.db`，可跳过提取，直接进入匹配或重建（视该库是否已含匹配而定）。
@@ -182,9 +182,44 @@ colmap model_analyzer --path sparse/0
 
 （具体参数见 [OpenSplat](https://github.com/pierotofy/OpenSplat) 仓库说明。）
 
+若 OpenSplat 报错 **`Unsupported camera model: 6`**（稀疏模型为 **FULL_OPENCV**），需先做 **去畸变**，输出为 **PINHOLE + 去畸变图**，见下一节脚本。
+
 ---
 
-## 9. 命令速查（复制用）
+## 9. 去畸变 → PINHOLE（`image_undistorter`，脚本）
+
+**作用**：在已有 **`images/`** 与 **`sparse/0/`** 上调用 COLMAP **`image_undistorter`**，生成 **`dense/`**（或自定义目录），其中：
+
+- **`dense/images/`**：去畸变后的图像；
+- **`dense/sparse/`**：与上面对应的稀疏模型，相机一般为 **PINHOLE** 或 **SIMPLE_PINHOLE**（以 COLMAP 导出为准）。
+
+**一键脚本**（工程路径默认 `/home/ccxx/colmap_ws`）：
+
+```bash
+cd /home/ccxx/colmap_ws
+chmod +x colmap_undistort_to_pinhole.sh
+./colmap_undistort_to_pinhole.sh
+```
+
+默认会 **删除并重建** 工程下的 **`dense/`**，并在同目录生成 **`opensplat_input/`**（`images/` + `sparse/0/`，便于打包上传）。若只要 `dense`、不要打包目录：
+
+```bash
+PACK=0 ./colmap_undistort_to_pinhole.sh
+```
+
+自定义路径示例：
+
+```bash
+BASE=/home/ccxx/colmap_ws IMAGE_SUB=images SPARSE_SUB=sparse/0 DENSE_SUB=dense ./colmap_undistort_to_pinhole.sh
+```
+
+脚本内已使用 **`env -u DISPLAY QT_QPA_PLATFORM=offscreen`**，便于 WSL 无图形环境。
+
+**注意**：训练 OpenSplat 时应使用 **`dense/images/`**（或 `opensplat_input/images/`）与 **`dense/sparse/`**（或 `opensplat_input/sparse/0/`），**不要**再与未去畸变的原 `images` 混用。
+
+---
+
+## 10. 命令速查（复制用）
 
 ```bash
 # 顺序匹配（WSL 无头 + CPU 匹配）
@@ -209,4 +244,6 @@ colmap model_analyzer --path sparse/0
 
 ---
 
-*文档对应流程：图像 →（特征）→ 匹配（`database.db`）→ 稀疏重建（`sparse/*/points3D.bin` 等）→ 再进入 OpenSplat。*
+*文档对应流程：图像 →（特征）→ 匹配（`database.db`）→ 稀疏重建（`sparse/*/points3D.bin` 等）→（可选）去畸变 → PINHOLE → 再进入 OpenSplat。*
+
+*去畸变脚本：`colmap_undistort_to_pinhole.sh`*
