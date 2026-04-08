@@ -137,6 +137,23 @@ docker run --rm opensplat bash -lc 'cd /code/build && ./opensplat --help'
 
 多分辨率、球谐、`refine-every` 等见 `--help` 全文。
 
+docker run --gpus all --rm -it \
+  -v /home/ccxx/colmap_ws/opensplat_input:/data/scene \
+  opensplat:latest \
+  bash -lc 'cd /code/build && ./opensplat /data/scene \
+    -n 22000 \
+    -d 2 \
+    --densify-grad-thresh 0.0003 \
+    --refine-every 150 \
+    --warmup-length 800 \
+    --reset-alpha-every 40 \
+    --stop-screen-size-at 3000 \
+    --ssim-weight 0.15 \
+    --save-every 2000 \
+    --val \
+    --val-render /data/scene/val_d2_opt \
+    -o /data/scene/splat_22000_d2_opt.ply'
+
 ---
 
 ## 第六步：查看与后期
