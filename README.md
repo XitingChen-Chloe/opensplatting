@@ -474,7 +474,26 @@ docker run --gpus all --rm -it \
     --val-render /data/scene/val_d2_opt \
     -o /data/scene/splat_22000_d2_opt.ply'
 ```
-
+Stricter densify, More frequent refine, More frequent alpha resets
+```bash
+docker run --gpus all --rm -it \
+  -v /home/ccxx/colmap_ws/opensplat_input:/data/scene \
+  opensplat:latest \
+  bash -lc 'cd /code/build && ./opensplat /data/scene \
+    -n 20000 \
+    -d 2 \
+    --densify-grad-thresh 0.0004 \
+    --refine-every 100 \
+    --warmup-length 700 \
+    --reset-alpha-every 28 \
+    --stop-screen-size-at 2500 \
+    --split-screen-size 0.04 \
+    --ssim-weight 0.15 \
+    --save-every 2000 \
+    --val \
+    --val-render /data/scene/val_d2_v2 \
+    -o /data/scene/splat_20000_d2_v2.ply'
+```
 ---
 
 ## 第六步：查看与后期
