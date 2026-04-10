@@ -1,67 +1,73 @@
-# opensplatting
+# OpenSplatting Technical Report: From COLMAP Sparse Reconstruction to OpenSplat Training
 
-# 从图像到稀疏 3D 点云（OpenSplat 之前）
-
-本文说明在 **OpenSplat** 训练之前，如何用 **COLMAP** 从 RGB 图像得到 **稀疏重建**（相机位姿 + 3D 点），工程目录以 `colmap_ws` 为例。
-
-**OpenSplat 所需**：`images/`（原图）+ `sparse/<模型ID>/`（至少含 `cameras.bin`、`images.bin`、`points3D.bin`，且含稀疏点）。稠密 MVS **不是** OpenSplat 的硬性前置。
+This document summarizes the project workflow ([opensplatting](https://github.com/XitingChen-Chloe/opensplatting)–related notes) and covers the end-to-end pipeline on **WSL2**: **COLMAP → (optional) undistortion / image compression → OpenSplat (Docker + CUDA)**.
 
 ---
 
-## 1. 环境与目录
+## 1. Abstract
 
-- **COLMAP**：`colmap --version`（示例：3.7）
-- **工作目录示例**：
+In a **WSL2** environment, **COLMAP** recovers camera poses and sparse 3D points from RGB images; **OpenSplat** then trains a **3D Gaussian Splatting** model, producing `splat.ply` and `cameras.json`. This report covers: sparse reconstruction, model validation, (optional) undistortion for PINHOLE compatibility, (optional) image compression, Docker image build and training, and common troubleshooting.
+
+---
+
+## 2. Goals and I/O
+
+| Stage | Input | Output |
+|------|------|------|
+| COLMAP | `images/`, (optional) new `database.db` | `database.db`, `sparse/0/` (or `1/`, …) |
+| Undistortion (if needed) | `images/` + `sparse/0/` | `dense/images/`, `dense/sparse/`, or packaged `opensplat_input/` |
+| OpenSplat | `images/` + `sparse/<model>/` | `splat.ply`, `cameras.json`, optional intermediate `splat_<steps>.ply` |
+
+**Note:** OpenSplat requires a **sparse model and images consistent with it**. Dense MVS is **not** a hard prerequisite for OpenSplat.
+
+---
+
+## 3. Environment and Toolchain
+
+- **WSL2:** For large datasets, prefer an ext4 home directory to reduce cross-filesystem I/O.
+- **COLMAP:** `colmap --version`; use CPU paths (`use_gpu 0`) when CUDA is unavailable.
+- **Docker:** `docker version` works; GPU requires `docker run --gpus all` and a working NVIDIA driver on the host.
+- **OpenSplat:** Typically build locally with `docker build` (e.g. `opensplat:latest`); binary inside the container: `/code/build/opensplat`.
+
+---
+
+## 4. Standard Directory Layout (COLMAP Project)
 
 ```text
 colmap_ws/
-├── images/           # RGB 图像（文件名、顺序与后续数据库一致）
-├── database.db       # SQLite：特征、匹配、图像元数据
-└── sparse/           # 稀疏重建输出（mapper 生成）
-    └── 0/            # 或其它编号
+├── images/           # RGB images; filenames must match DB / model
+├── database.db       # Features, matches, metadata
+└── sparse/           # mapper output
+    └── 0/            # primary model (or 1, 2, …)
 ```
 
-首次使用前若还没有 `database.db`，需先做 **特征提取**；若已从别处拷贝 `database.db`，可跳过提取，直接进入匹配或重建（视该库是否已含匹配而定）。
+If `database.db` does not exist yet, run feature extraction first. If you copy an existing database that already contains matches, you may skip extraction and go straight to matching or reconstruction, depending on the data.
 
 ---
 
-## 2. 特征提取（若无 `database.db` 或未提特征）
+## 5. Pipeline A: COLMAP Sparse Reconstruction
 
-在工程根目录执行：
+### 5.1 Feature Extraction
 
 ```bash
 cd /path/to/colmap_ws
-
-# 无图形界面时（WSL 常见）
 env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap feature_extractor \
   --database_path database.db \
   --image_path images
 ```
 
-若 COLMAP 为 **CPU 版**（`colmap -h` 显示 `without CUDA`），可加：
+For CPU-only COLMAP, add: `--SiftExtraction.use_gpu 0` (confirm with `colmap feature_extractor -h`).
+
+### 5.2 Feature Matching
+
+| Data type | Recommendation |
+|-----------|----------------|
+| Video / ordered sequence | `sequential_matcher` |
+| Unordered / orbit | `exhaustive_matcher` or `vocab_tree_matcher` |
+
+**Sequential matching example (headless WSL + CPU matching):**
 
 ```bash
-  --SiftExtraction.use_gpu 0
-```
-
-（参数名以 `colmap feature_extractor -h` 为准。）
-
----
-
-## 3. 特征匹配
-
-按数据类型选择：
-
-| 类型 | 命令 |
-|------|------|
-| **视频/VO 序列**（相邻帧相关） | `sequential_matcher` |
-| **无序/环绕** | `exhaustive_matcher` 或 `vocab_tree_matcher` |
-
-**顺序匹配示例**（与下文 WSL 无头环境一致）：
-
-```bash
-cd /path/to/colmap_ws
-
 env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap sequential_matcher \
   --database_path database.db \
   --SequentialMatching.overlap 30 \
@@ -69,24 +75,14 @@ env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap sequential_matcher \
   --SiftMatching.use_gpu 0
 ```
 
-说明：
+- `env -u DISPLAY`: avoids Qt errors from an invalid `DISPLAY`.
+- `QT_QPA_PLATFORM=offscreen`: runs without a window.
+- Matches are stored in **`database.db`**; there is no separate `matches/` folder.
 
-- **`env -u DISPLAY`**：避免 Cursor/远程给 WSL 设置了无效 `DISPLAY` 时 Qt 报错。
-- **`QT_QPA_PLATFORM=offscreen`**：无窗口运行。
-- **`--SiftMatching.use_gpu 0`**：CPU 版 COLMAP 或无 OpenGL 环境时避免 SiftGPU/OpenGL 崩溃。
-
-匹配结果写入 **`database.db`**（无单独 `matches` 文件夹）。
-
----
-
-## 4. 稀疏重建（得到 3D 点与相机）
-
-### 4.1 普通增量式重建（`mapper`）
+### 5.3 Incremental Reconstruction (`mapper`)
 
 ```bash
-cd /path/to/colmap_ws
 mkdir -p sparse
-
 env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap mapper \
   --database_path database.db \
   --image_path images \
@@ -99,22 +95,11 @@ env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap mapper \
   --Mapper.max_reg_trials 6
 ```
 
-说明：
+**Important:** Do **not** pass `--SiftMatching.*` to `mapper` (those flags apply only to `feature_extractor` / `*_matcher`).
 
-- **`mapper` 不要使用** `--SiftMatching.*`（该前缀仅用于 `feature_extractor` / `*_matcher`）。
-- **`--Mapper.num_threads`**：适当减小可降低内存峰值，减轻 OOM。
-- **`ba_global_*_freq`**：略增大可减少全局 BA 频率，有时减轻峰值内存（代价是优化节奏变化）。
-- **`abs_pose_*` / `max_reg_trials`**：注册困难时可适度放宽（需自行权衡精度）。
+**Very long sequences:** try `hierarchical_mapper` (see `colmap hierarchical_mapper -h`).
 
-输出在 **`sparse/0/`**（或 `1/`、`2/`…，取决于是否多模型、是否多次运行）。
-
-### 4.2 超长序列可选：`hierarchical_mapper`
-
-当图像很多、单次 `mapper` 易失败或内存不足时，可尝试分块合并式重建（参数见 `colmap hierarchical_mapper -h`）。
-
-### 4.3 从已有模型续跑（可选）
-
-仅在**明确要接着已有 `sparse/0` 增量注册**时使用：
+**Resume from an existing model** (only when you intentionally continue incremental registration):
 
 ```bash
 colmap mapper \
@@ -124,78 +109,35 @@ colmap mapper \
   --output_path sparse
 ```
 
-若上次重建异常中断或几何很差，宜**备份后清空/重建 `sparse`**，再**不带** `--input_path` 从头跑。
+If the previous run crashed or geometry is poor, back up and clear `sparse`, then rerun **without** `--input_path`.
 
----
-
-## 5. 结果检查
+### 5.4 Quality Check
 
 ```bash
 colmap model_analyzer --path sparse/0
 ```
 
-关注 **Registered images** 是否接近总图数、重投影误差是否合理。多模型时（`sparse/0`、`sparse/1`…）应对每个子目录分别检查；**主模型**一般是注册图像最多的那一套。
+Check whether **Registered images** is close to the total image count and whether reprojection error is reasonable. For multiple models (`sparse/0`, `sparse/1`, …), inspect each; **pick the model with the most registered images** as the primary one.
 
 ---
 
-## 6. 常见问题
+## 6. Pre–OpenSplat Checklist
 
-### 6.1 进程显示 `Killed`
-
-多为 **内存不足（OOM）**。可：
-
-- 在 Windows 用户目录配置 **`.wslconfig`** 增大 WSL 可用内存后执行 `wsl --shutdown` 再开 WSL；
-- 减小 `--Mapper.num_threads`；
-- 关闭其它占内存程序；
-- 或使用 **`hierarchical_mapper`** 等分块策略。
-
-### 6.2 Qt / `xcb` / `display` 报错
-
-使用本文 **`env -u DISPLAY QT_QPA_PLATFORM=offscreen`** 组合；匹配阶段再加 **`--SiftMatching.use_gpu 0`**。
-
-### 6.3 大量图像注册失败（`Could not register`）
-
-常见于 **前向运动、基线小、纹理重复**。可尝试：加强序列匹配重叠、放宽 `Mapper.abs_pose_*`、或使用 **分层/先验**（若有 VO 位姿需查当前 COLMAP 版本是否支持相应流程）。
+1. `images/` matches the images used for reconstruction.
+2. Use a `sparse/<id>/` with enough registered views.
+3. If downstream tools only accept `sparse/0/`, copy or symlink the primary model to `sparse/0/` (back up first).
+4. If OpenSplat reports an **unsupported camera model** (e.g. **FULL_OPENCV** in the sparse model), run undistortion first to obtain **PINHOLE / SIMPLE_PINHOLE** and undistorted images (next section).
 
 ---
 
-## 7. 可选：稠密点云（非 OpenSplat 必须）
+## 7. Pipeline B: Undistortion → PINHOLE (`image_undistorter`)
 
-若需要 **稠密** `.ply`，在已有 **`images/`** 与 **`sparse/0/`**（或你选定的主模型目录）上继续：
+**Purpose:** Given `images/` and `sparse/0/`, run `image_undistorter` to typically produce:
 
-1. `image_undistorter`：去畸变并准备稠密工作区  
-2. `patch_match_stereo`：块匹配  
-3. `stereo_fusion`：融合为稠密点云  
+- `dense/images/`: undistorted images
+- `dense/sparse/`: matching sparse model (cameras usually PINHOLE family)
 
-命令与路径以 [COLMAP 官方文档](https://colmap.github.io/) 为准；该流程耗时长、占磁盘大。
-
----
-
-## 8. 交给 OpenSplat 前
-
-1. 确认 **`images/`** 与重建所用图像一致。  
-2. 确认使用 **注册量足够** 的稀疏模型子目录（例如 `sparse/2/`）。  
-3. 若下游工具**只认 `sparse/0/`**，可将主模型复制或软链为 `sparse/0`（注意备份原有 `0`）。  
-4. 在 OpenSplat 工程根目录执行训练，例如：
-
-```bash
-/path/to/opensplat /path/to/colmap_ws -n 2000
-```
-
-（具体参数见 [OpenSplat](https://github.com/pierotofy/OpenSplat) 仓库说明。）
-
-若 OpenSplat 报错 **`Unsupported camera model: 6`**（稀疏模型为 **FULL_OPENCV**），需先做 **去畸变**，输出为 **PINHOLE + 去畸变图**，见下一节脚本。
-
----
-
-## 9. 去畸变 → PINHOLE（`image_undistorter`，脚本）
-
-**作用**：在已有 **`images/`** 与 **`sparse/0/`** 上调用 COLMAP **`image_undistorter`**，生成 **`dense/`**（或自定义目录），其中：
-
-- **`dense/images/`**：去畸变后的图像；
-- **`dense/sparse/`**：与上面对应的稀疏模型，相机一般为 **PINHOLE** 或 **SIMPLE_PINHOLE**（以 COLMAP 导出为准）。
-
-**一键脚本**（工程路径默认 `/home/ccxx/colmap_ws`）：
+If your project includes a one-shot script (e.g. `colmap_undistort_to_pinhole.sh`), typical usage:
 
 ```bash
 cd /home/ccxx/colmap_ws
@@ -203,278 +145,86 @@ chmod +x colmap_undistort_to_pinhole.sh
 ./colmap_undistort_to_pinhole.sh
 ```
 
-默认会 **删除并重建** 工程下的 **`dense/`**，并在同目录生成 **`opensplat_input/`**（`images/` + `sparse/0/`，便于打包上传）。若只要 `dense`、不要打包目录：
+- By default the script may delete and recreate `dense/` and emit `opensplat_input/` (`images/` + `sparse/0/`) for packaging.
+- Dense only, no package: `PACK=0 ./colmap_undistort_to_pinhole.sh`
+- Custom paths: pass `BASE`, `IMAGE_SUB`, `Sparse_SUB`, `DENSE_SUB`, etc. as environment variables.
 
-```bash
-PACK=0 ./colmap_undistort_to_pinhole.sh
-```
-
-自定义路径示例：
-
-```bash
-BASE=/home/ccxx/colmap_ws IMAGE_SUB=images SPARSE_SUB=sparse/0 DENSE_SUB=dense ./colmap_undistort_to_pinhole.sh
-```
-
-脚本内已使用 **`env -u DISPLAY QT_QPA_PLATFORM=offscreen`**，便于 WSL 无图形环境。
-
-**注意**：训练 OpenSplat 时应使用 **`dense/images/`**（或 `opensplat_input/images/`）与 **`dense/sparse/`**（或 `opensplat_input/sparse/0/`），**不要**再与未去畸变的原 `images` 混用。
+**Rule:** For OpenSplat training, **undistorted images** must be paired with the **undistorted sparse** model; **do not** mix them with original distorted images.
 
 ---
 
-## 10. 压缩图像（减小体积、便于上传）
+## 8. Pipeline C: Image Compression (Upload / Size Limits)
 
-上传平台有 **大小限制**（例如 2GB）或需节省空间时，可在 **不动稀疏几何文件** 的前提下，只对 **图像目录** 做压缩。**前提**：与当前使用的 **`sparse` / 相机** 一致——**文件名（含扩展名）不变**，**宽高（分辨率）不变**；否则投影与训练会错位。
+When compressing images **without** changing `sparse` geometry files, you must keep:
 
-### 10.1 该压哪一套目录？
+- **Filenames (including extension) unchanged**
+- **Resolution (width × height) unchanged**
 
-| 阶段 | 建议压缩对象 |
-|------|----------------|
-| 已做 **§9 去畸变**、准备给 OpenSplat | 压 **`dense/images/`**（或已拷好的 **`opensplat_input/images/`**），并与 **`dense/sparse/`**（或 **`opensplat_input/sparse/0/`**）成对使用 |
-| 仅 COLMAP、尚未去畸变 | 压 **`images/`** 时须与对应 **`sparse`** 为同一重建；更稳妥是 **压图前已定稿 sparse**，且 **不重跑 mapper** 时只替换像素内容 |
+Otherwise projection and training will be misaligned.
 
-**不要**：把 **去畸变后的图** 与 **未去畸变的 sparse** 混用，或改分辨率后仍用旧 `cameras.bin`。
+### 8.1 Which Folder to Compress?
 
-### 10.2 方式一：`compress_images.py`（Pillow，偏无损/轻量）
+| Stage | Recommendation |
+|-------|----------------|
+| After undistortion, ready for OpenSplat | Compress `dense/images/` or `opensplat_input/images/` together with the matching `sparse` |
+| COLMAP only, not undistorted | Compressing `images/` must match the current `sparse` reconstruction; safest to finalize `sparse` before compressing images |
 
-脚本：`colmap_ws/compress_images.py`。编辑其中 **`BASE`、`SRC`、`DST`**，例如从原图到 `images_small`：
+### 8.2 Option 1: `compress_images.py` (Pillow)
 
-```python
-BASE = Path("/home/ccxx/colmap_ws")
-SRC = BASE / "images"
-DST = BASE / "images_small"
-```
-
-对 **去畸变图** 可改为 `SRC = BASE / "dense/images"`，`DST = BASE / "dense/images_small"` 等。
+After setting `BASE`, `SRC`, `DST` in the script:
 
 ```bash
 pip3 install --user pillow
-python3 /home/ccxx/colmap_ws/compress_images.py
+python3 /path/to/colmap_ws/compress_images.py
 ```
 
-- **JPEG**：降低 `JPEG_QUALITY` 可明显减小体积。  
-- **PNG**：主要为无损优化，**体积降幅通常有限**（照片类 PNG 仍很大）。
+JPEG: adjust quality; PNG: often lossless optimization with limited size reduction.
 
-### 10.3 方式二：`pngquant_images.sh`（有损 PNG，体积常明显下降）
+### 8.3 Option 2: `pngquant_images.sh` (lossy PNG)
 
-需先安装：`sudo apt install -y pngquant`。
+Install: `sudo apt install -y pngquant`.  
+Use `BASE`, `SRC_NAME`, `DST_NAME`, `COLORS`, etc. to select folders and palette size.
 
-脚本：`colmap_ws/pngquant_images.sh`。默认从 **`images_small`** 生成 **`images_pngquant`**；可通过环境变量改输入/输出目录，例如对 **去畸变图** 生成 `dense/images_lq`：
+### 8.4 If Still Too Large
 
-```bash
-cd /home/ccxx/colmap_ws
-chmod +x pngquant_images.sh
-BASE=/home/ccxx/colmap_ws SRC_NAME=dense/images DST_NAME=dense/images_lq ./pngquant_images.sh
-```
+- Lower `COLORS` or JPEG quality slightly.
+- **Frame dropping** requires **re-running COLMAP**; you cannot delete images and keep the old model.
+- Request a larger upload quota or split archives.
 
-可选 **`COLORS`**（默认 `256`，更小可试 `128`）：
-
-```bash
-COLORS=128 BASE=/home/ccxx/colmap_ws SRC_NAME=dense/images DST_NAME=dense/images_lq ./pngquant_images.sh
-```
-
-完成后用 **`dense/images_lq`** 作为上传用的 **`images`**（或将其中文件覆盖到 **`opensplat_input/images/`**），**`sparse` 仍用与去畸变配套的那一份**。
-
-### 10.4 体积仍过大时
-
-- 在 **pngquant** 基础上再略降 **`COLORS`**，或  
-- **抽帧**（图变少）需 **重做 COLMAP 稀疏重建**，不能仅删图不换模型；或  
-- 向课程方申请 **更大上传限额 / 分卷**。
-
-更细的说明（含常见问题）见同目录 **`WSL_图像压缩说明.md`**。
+If present in the repo, see `WSL_图像压缩说明.md` for more detail.
 
 ---
 
-## 11. 命令速查（复制用）
+## 9. Pipeline D: OpenSplat (WSL2 + Docker)
 
-```bash
-# 顺序匹配（WSL 无头 + CPU 匹配）
-env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap sequential_matcher \
-  --database_path database.db \
-  --SequentialMatching.overlap 30 \
-  --SequentialMatching.quadratic_overlap 1 \
-  --SiftMatching.use_gpu 0
-
-# 稀疏重建（示例参数）
-env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap mapper \
-  --database_path database.db \
-  --image_path images \
-  --output_path sparse \
-  --Mapper.num_threads 4 \
-  --Mapper.ba_global_images_freq 1000 \
-  --Mapper.ba_global_points_freq 500000
-
-# 分析模型
-colmap model_analyzer --path sparse/0
-```
-
----
-
-*文档对应流程：图像 →（特征）→ 匹配（`database.db`）→ 稀疏重建（`sparse/*/points3D.bin` 等）→（可选）去畸变 → PINHOLE →（可选）压缩图像 → 再进入 OpenSplat。*
-
-*脚本：`colmap_undistort_to_pinhole.sh`（去畸变）、`compress_images.py` / `pngquant_images.sh`（压图）；压图详解见 `WSL_图像压缩说明.md`。*
-）→ 稀疏重建（`sparse/*/points3D.bin` 等）→（可选）去畸变 → PINHOLE → 再进入 OpenSplat。*
-
-*去畸变脚本：`colmap_undistort_to_pinhole.sh`*
-
-# OpenSplat：WSL2 + Docker 全流程说明
-
-本文说明在 WSL2 中通过 Docker 使用 [OpenSplat](https://github.com/pierotofy/OpenSplat) 的完整流程：从准备 Docker、构建镜像，到挂载 COLMAP 工程、训练输出与常用调参。
-
----
-
-## 前置条件
-
-- **WSL2**（任意常见 Linux 发行版）。
-- **NVIDIA GPU**：CUDA 版镜像需要主机已安装 **Windows 或 WSL 下的 NVIDIA 驱动**，且 Docker 能使用 GPU（Docker Desktop 开启 GPU 支持，或 Linux 下安装 `nvidia-container-toolkit`）。
-- **COLMAP 工程**：需包含 **相机位姿 + 稀疏点**，不能只依赖随机初始化。典型目录结构：
-  - `images/`：原始照片
-  - `sparse/0/`（或类似）：`cameras.bin`、`images.bin`、`points3D.bin` 等
-
----
-
-## 第一步：在 WSL 中确保 `docker` 可用
-
-若执行 `docker version` 报错 `command not found`：
-
-**方式 A（常见）**  
-在 Windows 安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，在 **Settings → Resources → WSL integration** 中为当前发行版勾选 **Enable integration**。  
-参考：[Docker Desktop 与 WSL 2](https://docs.docker.com/go/wsl2/)
-
-**方式 B**  
-在 WSL 内安装 Docker Engine（例如 `sudo apt install docker.io`），并将用户加入 `docker` 组。
-
----
-
-## 第二步：获取 OpenSplat 源码并构建镜像
-
-官方仓库通常**不提供**可直接 `docker pull` 的固定镜像名，需在本地 **构建**（默认 `Dockerfile` 为 **CUDA**）。
+### 9.1 Build the Image
 
 ```bash
 cd ~
 git clone https://github.com/pierotofy/OpenSplat.git
 cd OpenSplat
-docker build -t opensplat .
+docker build -t opensplat:latest .
 ```
 
-**显卡较新**（如 RTX 40 系）若编译报错，可指定 CUDA 架构，例如：
+If build fails on newer GPUs, specify CUDA architectures, e.g.:
 
 ```bash
-docker build -t opensplat \
+docker build -t opensplat:latest \
   --build-arg CMAKE_CUDA_ARCHITECTURES="75;80;86;89" \
   .
 ```
 
-构建完成后，镜像名为 **`opensplat`**，可执行文件在容器内路径：**`/code/build/opensplat`**。
+### 9.2 Mount Paths
 
----
+- WSL example: `/home/ccxx/colmap_ws/opensplat_input`
+- Windows drive: `D:\colmap` → `/mnt/d/colmap`
 
-## 第三步：准备数据路径
+For long training runs, prefer WSL ext4 storage.
 
-### 数据放在 WSL 家目录（示例：`~/colmap`）
+### 9.3 Run Training (Example)
 
-假设 COLMAP 工程在 WSL 中为：
+Replace the username/path with your actual WSL user:
 
-```text
-/home/你的用户名/colmap/
-  images/
-  sparse/
-```
-
-### 数据在 Windows D 盘
-
-WSL 中对应前缀为 **`/mnt/d/`**，例如：
-
-```text
-D:\colmap  →  /mnt/d/colmap
-```
-
-可将 `images`、`sparse` 复制到 `~/colmap`，或直接从 `/mnt/d/colmap` 挂载（大项目长期训练更推荐放在 WSL 的 ext4 家目录以减少 I/O 问题，按实际情况选择）。
-
----
-
-## 第四步：运行 OpenSplat（Docker）
-
-### 4.1 输入在 WSL，输出也在 WSL
-
-```bash
-docker run --gpus all --rm -it \
-  -v /home/你的用户名/colmap:/data/scene \
-  -v /home/你的用户名/colmap/out:/data/out \
-  opensplat \
-  bash -lc 'cd /code/build && ./opensplat /data/scene -n 30000 -o /data/out/splat.ply -d 1 --save-every 3000'
-```
-
-- **`/data/scene`**：COLMAP 工程根目录（其下需有 `images`、`sparse`）。
-- **`/data/out`**：输出目录；会生成 **`splat.ply`**，以及 **`cameras.json`**（与 `splat.ply` 同目录）。
-
-将 `你的用户名` 换成实际 WSL 用户名（例如 `ccxx`）。
-
-### 4.2 输出到 Windows 文件夹（例如 `D:\colmap\outcome\run1`）
-
-先创建目录，再挂载：
-
-```bash
-mkdir -p /mnt/d/colmap/outcome/run1
-
-docker run --gpus all --rm -it \
-  -v /home/你的用户名/colmap:/data/scene \
-  -v /mnt/d/colmap/outcome/run1:/data/out \
-  opensplat \
-  bash -lc 'cd /code/build && ./opensplat /data/scene -n 30000 -o /data/out/splat.ply -d 1 --save-every 3000'
-```
-
-Windows 侧路径：**`D:\colmap\outcome\run1\splat.ply`**、**`cameras.json`**。  
-若使用 **`--save-every`**，还会生成 **`splat_3000.ply`、`splat_6000.ply`** 等中间结果。
-
-### 4.3 输入直接使用 D 盘 COLMAP 工程
-
-```bash
-docker run --gpus all --rm -it \
-  -v /mnt/d/colmap:/data/scene \
-  -v /mnt/d/colmap/outcome/run1:/data/out \
-  opensplat \
-  bash -lc 'cd /code/build && ./opensplat /data/scene -n 30000 -o /data/out/splat.ply -d 1'
-```
-
----
-
-## 第五步：查看帮助与常用参数
-
-```bash
-docker run --rm opensplat bash -lc 'cd /code/build && ./opensplat --help'
-```
-
-| 参数 | 含义（简要） |
-|------|----------------|
-| `-n` / `--num-iters` | 迭代次数 |
-| `-d` / `--downscale-factor` | **1** = 不缩小原图；**2** = 宽高各约 1/2，省显存 |
-| `-o` / `--output` | 输出 `ply` 路径（`cameras.json` 写在同目录） |
-| `--save-every` | 每 N 步额外保存 `splat_<步数>.ply`（`-1` 关闭） |
-| `--densify-grad-thresh` | 增密梯度阈值；**调大**通常增密更少，可减轻浮点 |
-| `--resume` | 从已有 `ply` 继续训练 |
-
-多分辨率、球谐、`refine-every` 等见 `--help` 全文。
-
-调参优化
-```bash
-docker run --gpus all --rm -it \
-  -v /home/ccxx/colmap_ws/opensplat_input:/data/scene \
-  opensplat:latest \
-  bash -lc 'cd /code/build && ./opensplat /data/scene \
-    -n 22000 \
-    -d 2 \
-    --densify-grad-thresh 0.0003 \
-    --refine-every 150 \
-    --warmup-length 800 \
-    --reset-alpha-every 40 \
-    --stop-screen-size-at 3000 \
-    --ssim-weight 0.15 \
-    --save-every 2000 \
-    --val \
-    --val-render /data/scene/val_d2_opt \
-    -o /data/scene/splat_22000_d2_opt.ply'
-```
-Stricter densify, More frequent refine, More frequent alpha resets
 ```bash
 docker run --gpus all --rm -it \
   -v /home/ccxx/colmap_ws/opensplat_input:/data/scene \
@@ -494,35 +244,74 @@ docker run --gpus all --rm -it \
     --val-render /data/scene/val_d2_v2 \
     -o /data/scene/splat_20000_d2_v2.ply'
 ```
+
+Outputs typically include: `splat_*.ply`, `cameras.json`; with `--save-every`, intermediate `splat_<step>.ply` files.
+
+To use a custom image subdirectory (not default `images/`), use `--colmap-image-path` per your OpenSplat version’s `./opensplat --help`.
+
+### 9.4 Help
+
+```bash
+docker run --rm opensplat:latest bash -lc 'cd /code/build && ./opensplat --help'
+```
+
+Common flags: `-n` iterations, `-d` downscale, `--densify-grad-thresh` densification strength, `--resume` continue from a PLY, etc.
+
+### 9.5 Tuning (Reduce Floaters / Large Halos, Optional)
+
+On top of a baseline command, try individually:
+
+- Increase `--densify-grad-thresh` (fewer spurious Gaussians in the background)
+- Increase `--reset-alpha-every` (less frequent opacity resets that can “revive” artifacts)
+- Decrease `--split-screen-size` (suppress oversized splats)
+
+Tune values empirically for your data and VRAM.
+
+### 9.6 Viewing and Post-Processing
+
+Use a common Splat viewer or editor for `splat.ply` (per course or toolchain).
+
 ---
 
-## 第六步：查看与后期
+## 10. Pipeline E (Optional): COLMAP Dense Reconstruction
 
-- 浏览器查看示例：[PlayCanvas Viewer](https://playcanvas.com/viewer)、编辑浮点：[SuperSplat](https://playcanvas.com/supersplat/editor)。
-- 若画面像「平面地图」：尝试 **斜视/低机位** 浏览；航拍正射多时，可 **补拍倾斜角度** 改善高度感。
-
----
-
-## 故障排查简表
-
-| 现象 | 处理方向 |
-|------|----------|
-| `docker` 找不到 | Docker Desktop WSL 集成或本机安装 Docker |
-| 显存不足 | 使用 `-d 2` 或更大 downscale；或减少迭代、调参 |
-| 训练报错找不到图像 | 检查 `images` 路径与 COLMAP 中记录是否一致，必要时试 `--colmap-image-path` |
-| AMD GPU | 需使用仓库内 **ROCm** 相关 `Dockerfile` 单独构建，运行方式见 [OpenSplat README](https://github.com/pierotofy/OpenSplat) |
+For a dense `.ply`, continue from `images/` and a chosen `sparse/`: `image_undistorter` → `patch_match_stereo` → `stereo_fusion`.  
+This is slow and disk-heavy; **OpenSplat does not require it**. See the [COLMAP documentation](https://colmap.github.io/).
 
 ---
 
-## 流程小结
+## 11. Troubleshooting Summary
 
-1. WSL 内 **`docker` 可用** → `git clone` OpenSplat → **`docker build -t opensplat .`**  
-2. 准备好 **`images` + `sparse`** 的 COLMAP 工程目录  
-3. **`docker run --gpus all`**，**`-v 工程:/data/scene`**，**`-v 输出目录:/data/out`**  
-4. 执行 **`./opensplat /data/scene -o /data/out/splat.ply ...`**  
-5. 在输出目录取 **`splat.ply`**、**`cameras.json`**（及可选的中间 `splat_*.ply`）
+| Symptom | What to try |
+|---------|-------------|
+| Process `Killed` | OOM: increase WSL memory (`.wslconfig` + `wsl --shutdown`), lower `Mapper.num_threads`, or use `hierarchical_mapper` |
+| Qt / xcb / display | `env -u DISPLAY QT_QPA_PLATFORM=offscreen`; for matching, `SiftMatching.use_gpu 0` |
+| Many `Could not register` | Small baseline / weak texture: increase sequence overlap, relax `abs_pose_*`, or hierarchical / prior workflows |
+| Docker has no GPU | Enable Docker Desktop WSL integration + GPU; or install `nvidia-container-toolkit` |
+| GPU OOM | Increase `-d` (e.g. 2→4), reduce iterations or adjust other params |
+| Missing images / `Cannot read` | Match `images` path and COLMAP records; same extensions; `--colmap-image-path` if needed |
+| CUDA illegal memory access, etc. | Lower `-d` to test stability; check image channels/decoding; use `CUDA_LAUNCH_BLOCKING=1` for debugging (see PyTorch/CUDA docs) |
 
 ---
 
-*文档随本地路径举例编写，请将 `你的用户名`、盘符与目录名替换为实际环境。*
+## 12. End-to-End Summary
 
+1. Prepare `images/`; create and fill `database.db` if needed (feature extraction).
+2. Feature matching (e.g. `sequential_matcher` for sequences).
+3. Run `mapper` → `sparse/<id>/`; use `model_analyzer` to choose the primary model.
+4. If the camera model is incompatible with OpenSplat: undistort to PINHOLE + new images, with matching `sparse`.
+5. (Optional) Compress images without changing resolution or filenames.
+6. `docker build` OpenSplat, `docker run --gpus all`, mount the project, run `./opensplat`.
+7. Collect `splat.ply`, `cameras.json`, and optional validation render directory from the output location.
+
+---
+
+## 13. References
+
+- OpenSplat: https://github.com/pierotofy/OpenSplat  
+- COLMAP: https://colmap.github.io/  
+- Project notes repo (if applicable): https://github.com/XitingChen-Chloe/opensplatting  
+
+---
+
+*English version: `colmap_ws/OPEN_SPLATTING_REPORT_EN.md`. Chinese version: `colmap_ws/OPEN_SPLATTING_REPORT.md`. Replace local paths and usernames with your environment.*
